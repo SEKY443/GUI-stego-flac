@@ -279,8 +279,12 @@ fn a_recovered_pdf_is_still_a_pdf_to_the_system() {
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(text.contains("PDF document"), "got: {text}");
+    // libmagic's wording for the page count varies by platform/version --
+    // "9 pages" on the `file` build macOS ships, "9 page(s)" on the one
+    // Linux/Windows CI runners have -- so match the number and "page"
+    // without committing to a trailing "s" or "(s)".
     assert!(
-        text.contains("9 pages"),
+        text.contains("9 page"),
         "page tree did not survive: {text}"
     );
 }
@@ -624,7 +628,8 @@ fn multichannel_carries_a_real_pdf_intact() {
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        assert!(text.contains("8 pages"), "got: {text}");
+        // Same libmagic wording caveat as `a_recovered_pdf_is_still_a_pdf_to_the_system`.
+        assert!(text.contains("8 page"), "got: {text}");
     }
 }
 
