@@ -36,13 +36,18 @@ system WKWebView.
 uploading whatever installers land in `target/release/bundle/` as build
 artifacts.
 
-**Only the macOS build has been run and verified locally** in this
-environment (`cargo tauri build`/`--debug` both produce a working
-`stego-flac.app`; `cargo test --workspace` is green). The Windows and Linux
-legs are believed correct by construction — the dependency graph is pure
-Rust, the Tauri config lists standard targets for each OS — but have not
-actually been executed anywhere; treat their first real CI run as the actual
-test, not this write-up.
+**All three legs have passed in CI** (both `test` and `build` jobs green on
+`macos-latest`/`windows-latest`/`ubuntu-latest` — [run history](https://github.com/SEKY443/GUI-stego-flac/actions)),
+and the resulting installers are attached to the
+[releases](https://github.com/SEKY443/GUI-stego-flac/releases). The first
+attempt did fail on Ubuntu and Windows — not a packaging problem, but a
+pre-existing upstream test (`formats.rs`) that hardcoded macOS's `file`
+output wording ("9 pages" vs. Linux/Windows's "9 page(s)"); fixed by matching
+on "9 page" instead. Only macOS has additionally been verified **by hand**
+(launching the app, exercising encode/decode, confirming the theme) — the
+Windows and Linux builds are confirmed to compile, pass their test suite, and
+produce installers, but no person has clicked through the running app on
+either yet.
 
 Two macOS-specific gotchas hit during local verification, in case either
 resurfaces:

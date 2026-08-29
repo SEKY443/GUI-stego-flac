@@ -31,25 +31,33 @@ The Rust backend (`audio-modem-gui`) calls `audio-modem-core`/`audio-modem-io`
 directly — it never shells out to the `stego-flac` binary. Theme follows the
 OS light/dark setting automatically.
 
+## Download
+
+Prebuilt installers for all three platforms are attached to the
+[latest release](https://github.com/SEKY443/GUI-stego-flac/releases/latest):
+
+| Platform | File |
+|---|---|
+| macOS (Apple Silicon) | `.dmg` |
+| Windows (x64) | `.exe` (NSIS) or `.msi` |
+| Linux (x64) | `.AppImage`, `.deb`, or `.rpm` |
+
+These are unsigned builds (no Apple/Microsoft developer certificate yet), so
+macOS will warn "unidentified developer" on first launch (right-click → Open)
+and Windows SmartScreen will warn "unrecognized app" (More info → Run
+anyway). The app itself is unaffected either way.
+
 ## Platform status
 
-| Platform | Status |
-|---|---|
-| macOS (Apple Silicon) | **Built and verified locally** — `.app` and `.dmg` both launch and run correctly (light/dark theme confirmed by screenshot, encode/decode flow exercised) |
-| Windows | Configured (Tauri `nsis`/`msi` targets, CI job) but **not yet built or run anywhere** — no Windows machine was available to verify it |
-| Linux | Configured (Tauri `deb`/`rpm`/`AppImage` targets, CI job) but **not yet built or run anywhere** — no Linux machine was available to verify it |
-
-The Windows and Linux legs are believed correct by construction — every
-dependency in the workspace is pure Rust (`#![forbid(unsafe_code)]` in the
-core crate, no C toolchain requirements beyond what Tauri itself needs on
-each OS), and `tauri.conf.json` lists the standard bundle targets for each —
-but "should work" isn't the same claim as "has run." The
-[`build` GitHub Actions workflow](.github/workflows/build.yml) will build and
-test all three on push; treat its first green run on each OS as the actual
-verification, not this paragraph. See [`docs/packaging.md`](docs/packaging.md)
-for the macOS-specific gotchas already found and fixed while getting the
-local build working, in case either has a Windows/Linux analogue worth
-watching for.
+`cargo test --workspace` and `cargo tauri build` both pass in CI on
+`macos-latest`, `windows-latest`, and `ubuntu-latest` — see the
+[`build` GitHub Actions workflow](.github/workflows/build.yml). macOS was
+additionally verified locally by hand (launching the app, exercising the
+encode/decode flow, confirming the theme by screenshot); Windows and Linux
+have only been verified through that CI run, not by a person clicking through
+the app on those OSes. See [`docs/packaging.md`](docs/packaging.md) for the
+handful of macOS-specific packaging gotchas found and fixed along the way, in
+case either has a Windows/Linux analogue worth watching for.
 
 ## Layout
 
