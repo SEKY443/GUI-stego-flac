@@ -1,0 +1,31 @@
+[package]
+name = "audio-modem-gui"
+description = "Tauri desktop backend for stego-flac: calls audio-modem-core/audio-modem-io directly, never a subprocess."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "audio_modem_gui"
+crate-type = ["staticlib", "cdylib", "rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "stego-flac-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+audio-modem-core.workspace = true
+audio-modem-io.workspace = true
+
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"

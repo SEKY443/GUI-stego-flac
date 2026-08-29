@@ -1,0 +1,78 @@
+name: build desktop app
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install Linux webview dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: cargo test --workspace
+        run: cargo test --workspace --release
+
+  build:
+    name: build (${{ matrix.os }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: install Linux webview dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+      - name: install tauri-cli
+        run: cargo install tauri-cli --version "^2" --locked
+      # tauri.conf.json and Cargo.toml live in crates/audio-modem-gui (not a
+      # sibling `src-tauri/` next to package.json), so the build runs from
+      # there directly rather than relying on tauri-action's directory
+      # auto-detection. `cargo tauri build` reads beforeBuildCommand /
+      # frontendDist from tauri.conf.json and drives npm itself.
+      #
+      # Code signing/notarization is intentionally not configured here — it
+      # needs the maintainer's own certificates. Unsigned installers still
+      # build and run.
+      - name: build installers
+        working-directory: crates/audio-modem-gui
+        run: cargo tauri build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stego-flac-${{ matrix.os }}
+          path: |
+            target/release/bundle/**/*.dmg
+            target/release/bundle/**/*.msi
+            target/release/bundle/**/*.exe
+            target/release/bundle/**/*.deb
+            target/release/bundle/**/*.rpm
+            target/release/bundle/**/*.AppImage
+          if-no-files-found: warn

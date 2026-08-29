@@ -1,0 +1,9 @@
+/target
+crates/*/target
+crates/audio-modem-gui/gen
+apps/*/dist
+apps/*/node_modules
+apps/*/src-tauri/target
+apps/*/tsconfig.tsbuildinfo
+.DS_Store
+*.log

@@ -1,0 +1,9 @@
+{
+  "identifier": "default",
+  "description": "Capabilities for the stego-flac desktop app",
+  "windows": ["*"],
+  "permissions": [
+    "core:default",
+    "dialog:default"
+  ]
+}
