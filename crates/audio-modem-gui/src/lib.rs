@@ -9,6 +9,7 @@
 
 mod commands;
 mod error;
+mod progress;
 
 pub fn run() {
     tauri::Builder::default()

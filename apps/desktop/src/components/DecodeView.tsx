@@ -118,7 +118,10 @@ export function DecodeView() {
         </Field>
       )}
 
-      <Field label="Output location" hint="leave blank to use the carrier's stored filename">
+      <Field
+        label="Output location"
+        hint="leave blank to save next to the carrier, using its stored filename"
+      >
         <FilePicker
           value={outputPath}
           placeholder="(use the stored filename)"

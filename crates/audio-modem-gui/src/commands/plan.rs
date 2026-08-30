@@ -138,3 +138,84 @@ pub fn plan_preview(args: PlanArgsDto) -> CmdResult<PlanInfoDto> {
         presets,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_profile_name_is_a_clear_error_not_a_panic() {
+        let dto = PlanArgsDto {
+            profile: Some("quantum".to_string()),
+            ..Default::default()
+        };
+        let error = dto.to_overrides().unwrap_err();
+        assert!(error.message.contains("quantum"), "got: {}", error.message);
+    }
+
+    #[test]
+    fn every_known_profile_name_maps_to_the_right_preset() {
+        let cases = [
+            ("dense", Profile::Dense),
+            ("compact", Profile::Compact),
+            ("standard", Profile::Standard),
+            ("fast", Profile::Fast),
+        ];
+        for (name, expected) in cases {
+            let dto = PlanArgsDto {
+                profile: Some(name.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(dto.to_overrides().unwrap().profile, Some(expected));
+        }
+    }
+
+    #[test]
+    fn default_dto_is_not_explicit() {
+        assert!(!PlanArgsDto::default().is_explicit().unwrap());
+    }
+
+    #[test]
+    fn a_profile_choice_makes_the_dto_explicit() {
+        let dto = PlanArgsDto {
+            profile: Some("fast".to_string()),
+            ..Default::default()
+        };
+        assert!(dto.is_explicit().unwrap());
+    }
+
+    #[test]
+    fn plan_preview_succeeds_for_every_built_in_profile() {
+        for name in ["dense", "compact", "standard", "fast"] {
+            let dto = PlanArgsDto {
+                profile: Some(name.to_string()),
+                ..Default::default()
+            };
+            let info = plan_preview(dto).unwrap_or_else(|e| panic!("{name}: {}", e.message));
+            assert!(info.bit_rate > 0.0);
+            assert_eq!(info.presets.len(), 4);
+            assert_eq!(info.duration_for_payload.len(), 3);
+        }
+    }
+
+    #[test]
+    fn plan_preview_propagates_an_unknown_profile_as_a_command_error() {
+        let dto = PlanArgsDto {
+            profile: Some("quantum".to_string()),
+            ..Default::default()
+        };
+        assert!(plan_preview(dto).is_err());
+    }
+
+    #[test]
+    fn mismatched_overrides_surface_as_an_error_not_a_panic() {
+        // qam_bits is OFDM-only; pairing it with the FSK "standard" profile
+        // must fail cleanly rather than silently ignoring the override.
+        let dto = PlanArgsDto {
+            profile: Some("standard".to_string()),
+            qam_bits: Some(12),
+            ..Default::default()
+        };
+        assert!(plan_preview(dto).is_err());
+    }
+}

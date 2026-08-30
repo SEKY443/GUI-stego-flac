@@ -124,7 +124,7 @@ pub fn inspect(path: String, plan: PlanArgsDto) -> CmdResult<InfoDto> {
         payload_bytes: header.original_len,
         compressed: header.is_compressed(),
         encrypted: header.is_encrypted(),
-        argon2id: header.is_encrypted().then(|| Argon2Dto {
+        argon2id: header.is_encrypted().then_some(Argon2Dto {
             m_cost_kib: header.kdf.m_cost,
             t_cost: header.kdf.t_cost,
             p_cost: header.kdf.p_cost,

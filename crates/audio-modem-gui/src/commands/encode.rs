@@ -5,14 +5,15 @@ use std::path::{Path, PathBuf};
 use audio_modem_core::modem::ofdm::{COVER_FULL_HZ, COVER_TELEPHONE_HZ, COVER_WIDE_HZ};
 use audio_modem_core::{encode_frame, format, to_i16, Carrier, EncodeParams, FecParams, KdfParams, Plan};
 use audio_modem_io::flac_tags::{PLAN_TAG, PROFILE_TAG};
-use audio_modem_io::{cover, flac_io};
+use audio_modem_io::{cover, flac_io, ProgressSink};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 use zeroize::Zeroizing;
 
 use crate::commands::decode::FormatDto;
 use crate::commands::plan::PlanArgsDto;
 use crate::error::{CmdResult, CommandError};
+use crate::progress::TauriProgress;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -77,7 +78,7 @@ pub struct EncodeReportDto {
     pub carrier_ratio: f64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChannelChoice {
     Auto,
     Fixed(usize),
@@ -95,18 +96,20 @@ fn parse_channels(text: &str) -> CmdResult<ChannelChoice> {
     }
 }
 
-fn emit_stage(app: &AppHandle, what: &str) {
-    let _ = app.emit("encode://stage", what);
-}
-
 #[tauri::command]
 pub async fn encode(app: AppHandle, request: EncodeRequest) -> CmdResult<EncodeReportDto> {
-    tauri::async_runtime::spawn_blocking(move || encode_blocking(&app, request))
-        .await
-        .map_err(|error| CommandError::from(error.to_string()))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let progress = TauriProgress::new(&app, "encode://stage");
+        encode_blocking(&progress, request)
+    })
+    .await
+    .map_err(|error| CommandError::from(error.to_string()))?
 }
 
-fn encode_blocking(app: &AppHandle, request: EncodeRequest) -> CmdResult<EncodeReportDto> {
+pub(crate) fn encode_blocking(
+    progress: &dyn ProgressSink,
+    request: EncodeRequest,
+) -> CmdResult<EncodeReportDto> {
     let input = PathBuf::from(&request.input_path);
     let output = PathBuf::from(&request.output_path);
     if output.exists() && !request.force {
@@ -164,7 +167,7 @@ fn encode_blocking(app: &AppHandle, request: EncodeRequest) -> CmdResult<EncodeR
             .map(str::to_owned)
     };
 
-    emit_stage(app, "compressing and encrypting");
+    progress.stage("compressing and encrypting");
     let (frame, report) = encode_frame(&plaintext, stored_name.as_deref(), &params)
         .map_err(|error| CommandError::from(error.to_string()))?;
 
@@ -187,7 +190,7 @@ fn encode_blocking(app: &AppHandle, request: EncodeRequest) -> CmdResult<EncodeR
                 CommandError::from(format!("cover band does not fit this plan: {error}"))
             })?;
 
-            emit_stage(app, "loading cover audio");
+            progress.stage("loading cover audio");
             Some(
                 cover::load(Path::new(&opts.path), plan.sample_rate(), ceiling as f32)
                     .map_err(CommandError::from)?,
@@ -219,7 +222,7 @@ fn encode_blocking(app: &AppHandle, request: EncodeRequest) -> CmdResult<EncodeR
     let plan = plan;
     let modem = Carrier::new(plan).map_err(|error| CommandError::from(error.to_string()))?;
 
-    emit_stage(app, "modulating");
+    progress.stage("modulating");
 
     // Cover mode is single-channel: the cover is meant to be heard as one
     // ordinary recording, and channel-splitting produces one independent
@@ -256,7 +259,7 @@ fn encode_blocking(app: &AppHandle, request: EncodeRequest) -> CmdResult<EncodeR
     };
     let pcm = to_i16(&samples);
 
-    emit_stage(app, "encoding FLAC");
+    progress.stage("encoding FLAC");
     flac_io::write_flac(
         &output,
         &pcm,
@@ -343,4 +346,90 @@ fn tags(
     }
 
     tags
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use audio_modem_core::{EncodeReport, Profile};
+
+    #[test]
+    fn parse_channels_accepts_auto_case_insensitively() {
+        assert_eq!(parse_channels("auto").unwrap(), ChannelChoice::Auto);
+        assert_eq!(parse_channels("AUTO").unwrap(), ChannelChoice::Auto);
+        assert_eq!(parse_channels("Auto").unwrap(), ChannelChoice::Auto);
+    }
+
+    #[test]
+    fn parse_channels_accepts_one_through_eight() {
+        for n in 1..=8 {
+            assert_eq!(
+                parse_channels(&n.to_string()).unwrap(),
+                ChannelChoice::Fixed(n)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_channels_rejects_zero_nine_and_garbage() {
+        for text in ["0", "9", "many", "", "-1", "1.5"] {
+            assert!(parse_channels(text).is_err(), "expected {text:?} to be rejected");
+        }
+    }
+
+    fn dummy_report(encrypted: bool) -> EncodeReport {
+        EncodeReport {
+            plaintext_len: 100,
+            compressed_len: 100,
+            ciphertext_len: 100,
+            fec_packets: 1,
+            frame_len: 200,
+            compressed: false,
+            encrypted,
+        }
+    }
+
+    #[test]
+    fn tags_always_carries_the_load_bearing_plan_tag() {
+        let plan = Profile::Dense.plan();
+        let tags = tags(plan, &dummy_report(true), &[]);
+        let plan_value = tags.iter().find(|(k, _)| k == PLAN_TAG).map(|(_, v)| v.clone());
+        assert_eq!(plan_value.as_deref(), Some(plan.to_plan_string().as_str()));
+    }
+
+    #[test]
+    fn a_recognised_profile_gets_a_profile_tag_too() {
+        let plan = Profile::Fast.plan();
+        let tags = tags(plan, &dummy_report(true), &[]);
+        assert!(tags.iter().any(|(k, v)| k == PROFILE_TAG && v == "fast"));
+    }
+
+    #[test]
+    fn cover_tags_cannot_override_the_load_bearing_plan_or_profile_tags() {
+        let plan = Profile::Dense.plan();
+        let cover_tags = vec![
+            (PLAN_TAG.to_string(), "mode=fsk;forged".to_string()),
+            (PROFILE_TAG.to_string(), "forged".to_string()),
+            ("ARTIST".to_string(), "Someone".to_string()),
+        ];
+        let tags = tags(plan, &dummy_report(true), &cover_tags);
+
+        let plan_value = tags.iter().find(|(k, _)| k == PLAN_TAG).unwrap().1.clone();
+        assert_eq!(plan_value, plan.to_plan_string());
+        let profile_value = tags.iter().find(|(k, _)| k == PROFILE_TAG).unwrap().1.clone();
+        assert_eq!(profile_value, "dense");
+        // A non-load-bearing cover tag still comes through.
+        assert!(tags.iter().any(|(k, v)| k == "ARTIST" && v == "Someone"));
+    }
+
+    #[test]
+    fn cover_tags_override_the_default_title_and_description() {
+        let plan = Profile::Dense.plan();
+        let cover_tags = vec![("TITLE".to_string(), "My Recording".to_string())];
+        let tags = tags(plan, &dummy_report(false), &cover_tags);
+        let title = tags.iter().find(|(k, _)| k == "TITLE").unwrap().1.clone();
+        assert_eq!(title, "My Recording");
+        // Only one TITLE entry, not a duplicate.
+        assert_eq!(tags.iter().filter(|(k, _)| k == "TITLE").count(), 1);
+    }
 }

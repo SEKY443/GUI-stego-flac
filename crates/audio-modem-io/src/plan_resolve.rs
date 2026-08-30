@@ -118,3 +118,114 @@ impl PlanOverrides {
         Ok(plan)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_overrides_is_not_explicit() {
+        assert!(!PlanOverrides::default().is_explicit());
+    }
+
+    #[test]
+    fn any_single_field_makes_it_explicit() {
+        assert!(PlanOverrides {
+            profile: Some(Profile::Fast),
+            ..Default::default()
+        }
+        .is_explicit());
+        assert!(PlanOverrides {
+            amplitude: Some(0.5),
+            ..Default::default()
+        }
+        .is_explicit());
+        assert!(PlanOverrides {
+            qam_bits: Some(12),
+            ..Default::default()
+        }
+        .is_explicit());
+    }
+
+    #[test]
+    fn no_overrides_and_no_recorded_plan_falls_back_to_dense() {
+        let plan = PlanOverrides::default().resolve(None).unwrap();
+        assert_eq!(plan, Profile::Dense.plan());
+    }
+
+    #[test]
+    fn an_explicit_profile_overrides_a_recorded_plan() {
+        let recorded = Some(Profile::Compact.plan());
+        let overrides = PlanOverrides {
+            profile: Some(Profile::Fast),
+            ..Default::default()
+        };
+        assert_eq!(overrides.resolve(recorded).unwrap(), Profile::Fast.plan());
+    }
+
+    #[test]
+    fn no_profile_uses_the_recorded_plan_as_the_base() {
+        let recorded = Profile::Standard.plan();
+        let plan = PlanOverrides::default().resolve(Some(recorded)).unwrap();
+        assert_eq!(plan, recorded);
+    }
+
+    #[test]
+    fn an_ofdm_only_override_is_rejected_on_an_fsk_plan() {
+        let overrides = PlanOverrides {
+            profile: Some(Profile::Standard),
+            qam_bits: Some(12),
+            ..Default::default()
+        };
+        let error = overrides.resolve(None).unwrap_err();
+        assert!(error.contains("OFDM"), "got: {error}");
+    }
+
+    #[test]
+    fn an_fsk_only_override_is_rejected_on_an_ofdm_plan() {
+        let overrides = PlanOverrides {
+            profile: Some(Profile::Dense),
+            bits_per_symbol: Some(4),
+            ..Default::default()
+        };
+        let error = overrides.resolve(None).unwrap_err();
+        assert!(error.contains("FSK"), "got: {error}");
+    }
+
+    #[test]
+    fn sample_rate_and_amplitude_apply_to_either_waveform() {
+        let ofdm = PlanOverrides {
+            profile: Some(Profile::Dense),
+            sample_rate: Some(48_000),
+            amplitude: Some(0.5),
+            ..Default::default()
+        }
+        .resolve(None)
+        .unwrap();
+        assert_eq!(ofdm.sample_rate(), 48_000);
+        assert_eq!(ofdm.amplitude(), 0.5);
+
+        let fsk = PlanOverrides {
+            profile: Some(Profile::Standard),
+            sample_rate: Some(48_000),
+            amplitude: Some(0.5),
+            ..Default::default()
+        }
+        .resolve(None)
+        .unwrap();
+        assert_eq!(fsk.sample_rate(), 48_000);
+        assert_eq!(fsk.amplitude(), 0.5);
+    }
+
+    #[test]
+    fn base_bin_above_top_bin_is_rejected_by_validation() {
+        let overrides = PlanOverrides {
+            profile: Some(Profile::Dense),
+            base_bin: Some(500),
+            top_bin: Some(10),
+            ..Default::default()
+        };
+        let error = overrides.resolve(None).unwrap_err();
+        assert!(error.starts_with("invalid plan:"), "got: {error}");
+    }
+}
