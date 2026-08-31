@@ -7,3 +7,4 @@ apps/*/src-tauri/target
 apps/*/tsconfig.tsbuildinfo
 .DS_Store
 *.log
+/CHANGELOG.md
