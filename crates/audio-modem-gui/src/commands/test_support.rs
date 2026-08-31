@@ -35,6 +35,22 @@ impl Drop for TempDir {
     }
 }
 
+/// Deterministic pseudo-random bytes, standing in for already-compressed
+/// media — mirrors the equivalent fixture in `audio-modem-cli`'s integration
+/// tests, small enough that duplicating it here is cheaper than sharing a
+/// crate for it.
+pub fn incompressible(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 33) as u8
+        })
+        .collect()
+}
+
 /// A short 44.1 kHz mono WAV of a pure tone, just to exercise cover-audio
 /// loading (downmix + resample) without needing a real recording on disk.
 pub fn tone_wav(seconds: usize) -> Vec<u8> {

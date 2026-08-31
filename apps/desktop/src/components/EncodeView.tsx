@@ -54,13 +54,16 @@ export function EncodeView() {
   const [coverAttenuation, setCoverAttenuation] = useState(25);
   const [coverKeepMetadata, setCoverKeepMetadata] = useState(false);
 
+  const [splitEnabled, setSplitEnabled] = useState(false);
+  const [splitSizeMib, setSplitSizeMib] = useState(25);
+
   const [plan, setPlan] = useState<PlanArgsDto>(emptyPlanArgs);
   const [preview, setPreview] = useState<PlanInfoDto | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
 
   const [stage, setStage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [needsOverwrite, setNeedsOverwrite] = useState(false);
+  const [overwriteMessage, setOverwriteMessage] = useState<string | null>(null);
   const [report, setReport] = useState<EncodeReportDto | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -93,7 +96,9 @@ export function EncodeView() {
     outputPath !== null &&
     !busy &&
     (noEncrypt || (passphrase.length > 0 && !passphraseMismatch)) &&
-    (!coverEnabled || coverPath !== null);
+    (!coverEnabled || coverPath !== null) &&
+    (!splitEnabled || splitSizeMib > 0) &&
+    !(coverEnabled && splitEnabled);
 
   const requestBody = useMemo(
     () => ({
@@ -116,6 +121,7 @@ export function EncodeView() {
               keepMetadata: coverKeepMetadata,
             }
           : undefined,
+      splitSizeBytes: splitEnabled ? Math.round(splitSizeMib * 1024 * 1024) : undefined,
       plan,
       force: false,
     }),
@@ -136,6 +142,8 @@ export function EncodeView() {
       coverMode,
       coverAttenuation,
       coverKeepMetadata,
+      splitEnabled,
+      splitSizeMib,
       plan,
     ],
   );
@@ -143,7 +151,7 @@ export function EncodeView() {
   async function runEncode(force: boolean) {
     setBusy(true);
     setError(null);
-    setNeedsOverwrite(false);
+    setOverwriteMessage(null);
     setReport(null);
     try {
       const result = await encode({ ...requestBody, force });
@@ -152,7 +160,7 @@ export function EncodeView() {
     } catch (err) {
       const message = errorMessage(err);
       if (message.includes("already exists")) {
-        setNeedsOverwrite(true);
+        setOverwriteMessage(message);
       } else {
         setError(message);
       }
@@ -287,8 +295,42 @@ export function EncodeView() {
         </Field>
       </Section>
 
+      <Section title="Splitting into volumes" defaultOpen={false}>
+        <Checkbox
+          checked={splitEnabled}
+          onChange={(checked) => {
+            setSplitEnabled(checked);
+            if (checked) setCoverEnabled(false);
+          }}
+          label="Split the carrier across several smaller FLAC files"
+        />
+        {splitEnabled && (
+          <Field
+            label="Size per volume (MiB)"
+            hint="each part is written next to the output with .partI-of-N inserted before the extension; decode locates the rest on its own from any one part"
+          >
+            <TextInput
+              type="number"
+              min={1}
+              value={splitSizeMib}
+              onChange={(e) => setSplitSizeMib(Number(e.target.value))}
+            />
+          </Field>
+        )}
+        {splitEnabled && coverEnabled && (
+          <Banner kind="warning">Splitting cannot be combined with cover audio; disable one.</Banner>
+        )}
+      </Section>
+
       <Section title="Radio mode: hide under audible cover audio" defaultOpen={false}>
-        <Checkbox checked={coverEnabled} onChange={setCoverEnabled} label="Hide the carrier under cover audio" />
+        <Checkbox
+          checked={coverEnabled}
+          onChange={(checked) => {
+            setCoverEnabled(checked);
+            if (checked) setSplitEnabled(false);
+          }}
+          label="Hide the carrier under cover audio"
+        />
         {coverEnabled && (
           <div className="space-y-3">
             <Field label="Cover audio file" hint="FLAC, WAV, MP3, or MP4/M4A">
@@ -354,10 +396,10 @@ export function EncodeView() {
         {busy && <ProgressBar stage={stage} />}
       </div>
 
-      {needsOverwrite && (
+      {overwriteMessage && (
         <Banner kind="warning">
           <div className="flex items-center justify-between gap-3">
-            <span>{outputPath} already exists.</span>
+            <span>{overwriteMessage}</span>
             <Button variant="danger" onClick={() => runEncode(true)}>
               Overwrite
             </Button>
@@ -368,7 +410,22 @@ export function EncodeView() {
 
       {report && (
         <Section title="Result">
-          <Row label="Wrote" value={report.outputPath} />
+          {report.volumes.length > 0 ? (
+            <div className="space-y-1 pb-1">
+              <span className="text-xs font-medium uppercase tracking-wide text-neutral-500 dark:text-neutral-400">
+                Wrote {report.volumes.length} volumes
+              </span>
+              {report.volumes.map((v) => (
+                <Row
+                  key={v.part}
+                  label={`${v.part}/${v.of}`}
+                  value={`${v.path} (${humanBytes(v.carrierBytes)}, ${humanDuration(v.durationSecs)}, ${v.channels} ch)`}
+                />
+              ))}
+            </div>
+          ) : (
+            <Row label="Wrote" value={report.outputPath} />
+          )}
           <Row label="Input" value={humanBytes(report.plaintextBytes)} />
           <Row
             label="Compressed"
@@ -390,14 +447,24 @@ export function EncodeView() {
               value={`${report.coverBandHz[0].toFixed(0)}-${report.coverBandHz[1].toFixed(0)} Hz`}
             />
           )}
-          <Row
-            label="Carrier"
-            value={`${humanDuration(report.durationSecs)}${report.channels > 1 ? ` across ${report.channels} channels` : ""}`}
-          />
-          <Row
-            label="FLAC file"
-            value={`${humanBytes(report.carrierBytes)} (${report.carrierRatio.toFixed(2)}x plaintext)`}
-          />
+          {report.volumes.length === 0 && (
+            <>
+              <Row
+                label="Carrier"
+                value={`${humanDuration(report.durationSecs)}${report.channels > 1 ? ` across ${report.channels} channels` : ""}`}
+              />
+              <Row
+                label="FLAC file"
+                value={`${humanBytes(report.carrierBytes)} (${report.carrierRatio.toFixed(2)}x plaintext)`}
+              />
+            </>
+          )}
+          {report.volumes.length > 0 && (
+            <Row
+              label="Carrier (total)"
+              value={`${humanDuration(report.durationSecs)}, ${humanBytes(report.carrierBytes)} (${report.carrierRatio.toFixed(2)}x plaintext)`}
+            />
+          )}
           {!report.encrypted && (
             <Banner kind="warning">This carrier is not encrypted; anyone with the file can read it.</Banner>
           )}

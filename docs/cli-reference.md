@@ -25,7 +25,8 @@ does not. See [Two carriers you can play](#two-carriers-you-can-play).
 
 ## Contents
 
-**Using it** — [Install](#install) · [Use](#use) · [Throughput](#throughput) ·
+**Using it** — [Install](#install) · [Use](#use) ·
+[Splitting into volumes](#splitting-into-volumes) · [Throughput](#throughput) ·
 [How big the carrier gets](#how-big-the-carrier-gets) ·
 [Two carriers you can play](#two-carriers-you-can-play) ·
 [Radio mode](#radio-mode-hiding-the-data-under-audible-audio)
@@ -88,6 +89,11 @@ stego-flac encode secrets.txt --cover song.ogg --cover-quality telephone
 
 # Spread the payload over several audio channels: same size, shorter carrier.
 stego-flac encode big.bin --channels auto
+
+# Split a large carrier into several smaller FLAC files. `decode` finds and
+# rejoins the rest on its own -- point it at any one part.
+stego-flac encode big.bin --split-size 20M
+stego-flac decode big.bin.part1-of-4.flac
 
 # Shell completions.
 stego-flac completions zsh > ~/.zfunc/_stego-flac
@@ -157,6 +163,39 @@ instead written to stderr as one `{"stage": "..."}` line per stage, regardless
 of whether stderr is a TTY — the case a wrapping GUI or script is actually in.
 `decode -o -` keeps the payload on stdout and moves the JSON report to stderr,
 the same way it already moves the text summary there.
+
+## Splitting into volumes
+
+`--split-size` divides a finished carrier into several smaller FLAC files
+instead of one, the same idea as a split RAR or 7z archive:
+
+```
+$ stego-flac encode movie.mkv --split-size 25M
+wrote 6 volumes:
+  1/6  movie.mkv.part1-of-6.flac  (25.0 MiB, ...)
+  2/6  movie.mkv.part2-of-6.flac  (25.0 MiB, ...)
+  ...
+
+$ stego-flac decode movie.mkv.part4-of-6.flac
+recovered 148.2 MiB to movie.mkv (reassembled from 6 volumes)
+```
+
+Every part carries, inside its own modulated header — not just as FLAC tags
+that a re-encode or a careless edit could lose — the archive it belongs to, its
+own position, and the total part count. `decode` needs only one part's path:
+it locates the siblings by filename (`<name>.partI-of-N.<ext>`, written next to
+each other), demodulates each, and refuses to proceed unless every part is
+present, undamaged, and from the same archive — a corrupt or mismatched part
+is named in the error rather than surfacing as an opaque RaptorQ failure once
+every other part has already been read. A size at or above the finished frame
+produces a single, ordinarily-named file, so `--split-size` is always safe to
+pass speculatively.
+
+Splitting happens after compression, encryption, and FEC, and does not add
+redundancy across the volume boundary the way FEC does within one: every part
+is a disjoint slice, and losing one is fatal to the whole archive, exactly
+like a split RAR. It is not compatible with `--cover`, since a split's parts
+would each need their own disguise.
 
 ## Throughput
 
@@ -463,6 +502,35 @@ RaptorQ reconstructed — coding first would compute repair symbols over plainte
 and force the receiver to process untrusted data before it could authenticate
 anything.
 
+### The volume header
+
+`--split-size` slices the *finished* frame — after zstd, AES-GCM and RaptorQ —
+into consecutive byte ranges and prefixes each with a small 48-byte header of
+its own, distinguished by a different magic so a bare-frame carrier and a
+volume can never be confused for each other:
+
+```
+ off  len  field         notes
+   0    4  magic "AMVL"
+   4    1  version       1
+   5    3  reserved
+   8    8  archive_id    random, shared by every volume in the set
+  16    4  volume_index  0-based
+  20    4  volume_count  total volumes in the set
+  24    8  volume_len    bytes of the frame slice following this header
+  32    8  total_len     bytes of the full reassembled frame
+  40    4  volume_crc    CRC-32 over this volume's slice bytes
+  44    4  header_crc    CRC-32 over bytes 0..44
+```
+
+`join` reverses this by concatenating the ranges back in order, which
+reproduces the original frame bit-for-bit — RaptorQ, AES-GCM and zstd never
+know splitting happened. Two checksums exist for two different failures:
+`header_crc` catches a mis-demodulated or wrong-tone-plan read, the same job
+the main frame header's CRC does; `volume_crc` covers the payload slice
+itself, so a damaged part is reported by name instead of surfacing as an
+opaque RaptorQ failure only after every other part has already been read.
+
 ### Numbers for the default profile
 
 | quantity | value |
@@ -603,6 +671,13 @@ plan simply demodulates to something that fails the header CRC. Nothing
 security-relevant is stored there. In particular the *filename* is not: it lives
 inside the encrypted payload, because filenames are often more revealing than
 the bytes they label.
+
+One part of a `--split-size` archive additionally carries
+`AUDIOMODEM_VOLUME=2/6` — readable the same way, purely for a human glancing at
+the file. It is no more authoritative than the other tags: `decode` locates and
+orders volumes from the [in-band header](#the-volume-header) each one carries
+in its modulated payload, not from this tag, so a carrier with it stripped is
+exactly as recoverable as one that never had it.
 
 The plan records the waveform too, so a carrier written with any profile decodes
 with no flags. A plan string with no `mode` field is read as FSK, which is what

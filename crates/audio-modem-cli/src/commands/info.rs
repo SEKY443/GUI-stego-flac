@@ -3,6 +3,7 @@
 use std::fs;
 
 use anyhow::{bail, Context, Result};
+use audio_modem_core::frame::volume::{self, VolumeHeader};
 use audio_modem_core::{from_i16, Carrier, Header, HEADER_LEN};
 use audio_modem_io::flac_io;
 use audio_modem_io::flac_tags::{self, PLAN_TAG, PROFILE_TAG};
@@ -59,6 +60,17 @@ pub fn run(args: &InfoArgs) -> Result<()> {
 
     let header_samples = from_i16(&audio.samples[..needed]);
     let header_bytes = modem.demodulate_interleaved(&header_samples, audio.channels)?;
+
+    // A split archive's parts start "AMVL", not the plain frame's "AMDM":
+    // report what this part is, rather than failing with "bad magic" on
+    // something that is a perfectly good stego-flac file, just not this one.
+    // `header_bytes` already holds enough for the volume header regardless,
+    // since `VOLUME_HEADER_LEN` (48) is smaller than `HEADER_LEN` (92).
+    if header_bytes.len() >= 4 && header_bytes[0..4] == volume::VOLUME_MAGIC {
+        let volume_header = VolumeHeader::parse(&header_bytes)?;
+        return print_volume_info(args, &volume_header, duration, plan_in_metadata, &profile_label);
+    }
+
     let header = Header::parse(&header_bytes)?;
 
     let declared = header.frame_len();
@@ -174,6 +186,58 @@ pub fn run(args: &InfoArgs) -> Result<()> {
         );
         println!("  RaptorQ repair symbols may still recover it; try `decode`.");
     }
+
+    Ok(())
+}
+
+/// Report on one part of a split archive, in place of the plain-frame report.
+fn print_volume_info(
+    args: &InfoArgs,
+    header: &VolumeHeader,
+    duration: f64,
+    plan_in_metadata: bool,
+    profile_label: &str,
+) -> Result<()> {
+    let part = header.volume_index + 1;
+
+    if args.output_args.json {
+        let out = json!({
+            "path": args.input.display().to_string(),
+            "duration_secs": duration,
+            "profile": profile_label,
+            "plan_in_metadata": plan_in_metadata,
+            "volume": {
+                "archive_id": format!("{:016x}", header.archive_id),
+                "part": part,
+                "of": header.volume_count,
+                "volume_bytes": header.volume_len,
+                "total_frame_bytes": header.total_len,
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    println!("{}", args.input.display());
+    println!();
+    println!(
+        "  split archive      part {part} of {}",
+        header.volume_count
+    );
+    println!("  archive id         {:016x}", header.archive_id);
+    println!("  duration           {}", human_duration(duration));
+    println!("  profile            {profile_label}");
+    if !plan_in_metadata {
+        println!("                     (no plan recorded in metadata)");
+    }
+    println!("  volume payload     {}", human_bytes(header.volume_len));
+    println!("  full frame         {}", human_bytes(header.total_len));
+    println!();
+    println!(
+        "  `decode` on this file, or any sibling, locates the other {} part(s) and \
+         reassembles the frame automatically.",
+        header.volume_count.saturating_sub(1)
+    );
 
     Ok(())
 }

@@ -55,7 +55,35 @@ export function InfoView() {
 
       {error && <Banner kind="error">{error}</Banner>}
 
-      {info && (
+      {info?.volume && (
+        <Section title="Split archive volume">
+          <Row label="Part" value={`${info.volume.part} of ${info.volume.of}`} />
+          <Row label="Archive ID" value={info.volume.archiveId} />
+          <Row
+            label="Container"
+            value={`${info.sampleRateHz} Hz, ${info.channels} channel(s), ${info.samples} samples`}
+          />
+          <Row label="Duration" value={`${info.durationSecs.toFixed(1)} s`} />
+          <Row label="Profile" value={info.profileLabel} />
+          <Row label="Waveform" value={`${info.waveformDescription} (${info.bitRate.toFixed(0)} bit/s)`} />
+          {!info.planInMetadata && (
+            <Banner kind="warning">No plan recorded in metadata — the plan above was assumed.</Banner>
+          )}
+          <Row label="Volume payload" value={humanBytes(info.volume.volumeBytes)} />
+          <Row label="Full frame" value={humanBytes(info.volume.totalFrameBytes)} />
+          <Banner kind="info">
+            Decoding this file, or any sibling, locates the other {info.volume.of - 1} part(s) and
+            reassembles the frame automatically.
+          </Banner>
+          {info.warnings.map((warning, i) => (
+            <Banner key={i} kind="warning">
+              {warning}
+            </Banner>
+          ))}
+        </Section>
+      )}
+
+      {info && !info.volume && (
         <Section title="Report">
           <Row
             label="Container"
@@ -68,8 +96,8 @@ export function InfoView() {
           {!info.planInMetadata && (
             <Banner kind="warning">No plan recorded in metadata — the plan above was assumed.</Banner>
           )}
-          <Row label="Format version" value={info.formatVersion} />
-          <Row label="Payload size" value={humanBytes(info.payloadBytes)} />
+          <Row label="Format version" value={info.formatVersion ?? "—"} />
+          <Row label="Payload size" value={humanBytes(info.payloadBytes ?? 0)} />
           <Row label="Compressed" value={info.compressed ? "yes" : "no"} />
           <Row label="Encrypted" value={info.encrypted ? "yes" : "no"} />
           {info.argon2id && (
@@ -87,10 +115,10 @@ export function InfoView() {
             value={info.formatStored ? (info.encrypted ? "yes (encrypted)" : "yes") : "no"}
           />
           <Row label="FEC" value={info.fec ? "yes" : "no"} />
-          <Row label="FEC symbol size" value={`${info.fecSymbolSizeBytes} B`} />
-          <Row label="Frame size" value={humanBytes(info.frameBytes)} />
-          <Row label="Carried bytes" value={humanBytes(info.carriedBytes)} />
-          {info.shortByBytes != null && (
+          <Row label="FEC symbol size" value={`${info.fecSymbolSizeBytes ?? 0} B`} />
+          <Row label="Frame size" value={humanBytes(info.frameBytes ?? 0)} />
+          <Row label="Carried bytes" value={humanBytes(info.carriedBytes ?? 0)} />
+          {info.shortByBytes != null && info.frameBytes != null && (
             <Banner kind="warning">
               Carrier is short by {humanBytes(info.shortByBytes)} —{" "}
               {((info.shortByBytes / info.frameBytes) * 100).toFixed(2)}% of the frame is missing.

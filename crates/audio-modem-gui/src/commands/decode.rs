@@ -9,8 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
-use audio_modem_core::{decode_frame, from_i16, Carrier, DecodedPayload, Header};
-use audio_modem_io::{flac_io, ProgressSink};
+use audio_modem_core::frame::volume::{self, VolumeHeader};
+use audio_modem_core::{decode_frame, Carrier, DecodedPayload, Header};
+use audio_modem_io::{flac_io, join_volume_set, prepare_samples, ProgressSink};
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use zeroize::Zeroizing;
@@ -59,6 +60,10 @@ pub struct DecodeReportDto {
     pub format: Option<FormatDto>,
     pub encoded_at_unix: Option<u64>,
     pub warnings: Vec<String>,
+    /// The part count when `input_path` was one part of a split archive that
+    /// `decode` located and reassembled on its own; `None` for an ordinary
+    /// single-file carrier.
+    pub volumes_joined: Option<u32>,
 }
 
 #[tauri::command]
@@ -90,37 +95,26 @@ pub(crate) fn decode_blocking(
     let audio = flac_io::read_flac(&input).map_err(CommandError::from)?;
     warnings.extend(audio.warnings.iter().cloned());
 
-    if audio.channels == 0 || audio.channels > 8 {
-        return Err(CommandError::from(format!(
-            "{} declares {} channels; stego-flac carriers use 1 to 8",
-            input.display(),
-            audio.channels
-        )));
-    }
-    if audio.sample_rate != plan.sample_rate() {
-        return Err(CommandError::from(format!(
-            "{} is {} Hz but the tone plan expects {} Hz",
-            input.display(),
-            audio.sample_rate,
-            plan.sample_rate()
-        )));
-    }
-
-    let group = modem.alignment_samples() * audio.channels;
-    let usable = audio.samples.len() - audio.samples.len() % group;
-    if usable == 0 {
-        return Err(CommandError::from(format!(
-            "{} holds {} samples, fewer than one symbol group",
-            input.display(),
-            audio.samples.len()
-        )));
-    }
-    let samples = from_i16(&audio.samples[..usable]);
+    let samples = prepare_samples(&audio, &modem, &input).map_err(CommandError::from)?;
 
     progress.stage("demodulating");
-    let frame = modem
+    let piece = modem
         .demodulate_interleaved(&samples, audio.channels)
         .map_err(|error| CommandError::from(error.to_string()))?;
+
+    // A plain frame starts "AMDM" and is decoded as-is; a volume starts
+    // "AMVL" and means `input` is only one part of a split archive. The rest
+    // are found by filename, demodulated the same way, and joined back into
+    // the single frame `decode_frame` expects -- from here on nothing below
+    // has to know splitting happened.
+    let (frame, volumes_joined) = if piece.len() >= 4 && piece[0..4] == volume::VOLUME_MAGIC {
+        progress.stage("locating and joining volumes");
+        let count = VolumeHeader::parse(&piece).map(|h| h.volume_count).ok();
+        let joined = join_volume_set(&input, piece, &modem).map_err(CommandError::from)?;
+        (joined, count)
+    } else {
+        (piece, None)
+    };
 
     let header = Header::parse(&frame).map_err(|error| {
         CommandError::from(if recorded.is_some() {
@@ -167,6 +161,7 @@ pub(crate) fn decode_blocking(
         format: payload.format.map(FormatDto::from),
         encoded_at_unix: payload.encoded_at,
         warnings,
+        volumes_joined,
     })
 }
 

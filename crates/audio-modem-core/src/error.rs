@@ -216,6 +216,69 @@ pub enum FrameError {
     /// genuine encoder bug rather than tampering.
     #[error("payload name envelope is malformed: {reason}")]
     MalformedEnvelope { reason: &'static str },
+
+    // --- multi-volume splitting ------------------------------------------
+    #[error("split volume size must be at least 1 byte")]
+    ZeroVolumeSize,
+
+    #[error("could not read from the system random source: {0}")]
+    VolumeRng(String),
+
+    #[error("volume is {len} bytes, shorter than the {needed}-byte volume header")]
+    VolumeTooShort { len: usize, needed: usize },
+
+    /// The first four bytes are not `AMVL`. Either this is not a stego-flac
+    /// volume at all, or the tone plan used to demodulate it does not match
+    /// the one used to write it.
+    #[error(
+        "bad volume magic {got:02x?}: this audio was not produced by stego-flac's \
+         --split-size, or the tone plan differs"
+    )]
+    VolumeBadMagic { got: [u8; 4] },
+
+    #[error("unsupported volume format version {got}, this build understands {supported}")]
+    VolumeUnsupportedVersion { got: u8, supported: u8 },
+
+    #[error("volume header checksum mismatch (stored {stored:#010x}, computed {computed:#010x})")]
+    VolumeHeaderCrcMismatch { stored: u32, computed: u32 },
+
+    #[error("volume declares {declared} payload bytes but only {available} follow its header")]
+    VolumeTruncated { declared: u64, available: usize },
+
+    /// The header parsed and checksummed cleanly, but the bytes it wraps did
+    /// not. Distinguished from [`FrameError::VolumeHeaderCrcMismatch`] because
+    /// this points at *this specific file* being damaged, whereas a header CRC
+    /// failure could equally mean a demodulation or tone-plan mismatch.
+    #[error(
+        "volume {index} failed its integrity check (stored crc {stored:#010x}, computed \
+         {computed:#010x}); this part is corrupt"
+    )]
+    VolumeCorrupt {
+        index: u32,
+        stored: u32,
+        computed: u32,
+    },
+
+    #[error(
+        "volume set mixes two different archives ({first:016x} and {other:016x}); these \
+         parts do not belong together"
+    )]
+    VolumeArchiveMismatch { first: u64, other: u64 },
+
+    #[error(
+        "volume set disagrees on its own size: one part says {count_a} volumes, another says \
+         {count_b}"
+    )]
+    VolumeCountMismatch { count_a: u32, count_b: u32 },
+
+    #[error("volume {index} is missing; this archive needs all {count} parts")]
+    VolumeMissing { index: u32, count: u32 },
+
+    #[error("volume {index} was supplied more than once")]
+    VolumeDuplicate { index: u32 },
+
+    #[error("joined volumes total {got} bytes but the header declares {expected}")]
+    VolumeLengthMismatch { expected: u64, got: u64 },
 }
 
 /// Aggregate error surfaced at the crate boundary.

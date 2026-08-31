@@ -237,6 +237,21 @@ pub struct EncodeArgs {
     #[arg(long, requires = "cover")]
     pub keep_cover_metadata: bool,
 
+    /// Split the carrier across several smaller FLAC files instead of one.
+    ///
+    /// Each part is written next to `--output` with `.partI-of-N` inserted
+    /// before the extension, and records, inside its own modulated header,
+    /// the archive it belongs to, its own position, and the total part
+    /// count — the same idea as a split RAR or 7z. `decode` needs only one
+    /// part's path: it locates the rest by their filenames and reassembles
+    /// the frame automatically before decoding, refusing to proceed unless
+    /// every part is present, undamaged, and from the same archive. Not
+    /// compatible with `--cover`, since a split's parts would each need
+    /// their own disguise. A size at or above the finished frame produces a
+    /// single, ordinarily-named file, so this is always safe to pass.
+    #[arg(long, value_name = "SIZE", conflicts_with = "cover")]
+    pub split_size: Option<ByteSize>,
+
     /// Audio channels to interleave the payload across: 1-8, or `auto`.
     ///
     /// Divides the carrier's *duration* by this factor and leaves its size
@@ -396,6 +411,40 @@ impl PlanArgs {
         self.to_overrides()
             .resolve(recorded)
             .map_err(|error| anyhow::anyhow!(error))
+    }
+}
+
+/// A byte count parsed from a human size like `10M` or `700KiB`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteSize(pub usize);
+
+impl std::str::FromStr for ByteSize {
+    type Err = String;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        let trimmed = text.trim();
+        let split_at = trimmed
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(trimmed.len());
+        let (digits, suffix) = trimmed.split_at(split_at);
+
+        let value: f64 = digits
+            .parse()
+            .map_err(|_| format!("expected a byte size like `10M` or `700KiB`, got {text:?}"))?;
+
+        let multiplier = match suffix.trim().to_ascii_lowercase().as_str() {
+            "" | "b" => 1.0,
+            "k" | "kb" | "kib" => 1024.0,
+            "m" | "mb" | "mib" => 1024.0 * 1024.0,
+            "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+            other => return Err(format!("unknown size suffix {other:?}; use K, M, or G")),
+        };
+
+        let bytes = value * multiplier;
+        if !bytes.is_finite() || bytes < 1.0 {
+            return Err(format!("byte size must be at least 1, got {text:?}"));
+        }
+        Ok(ByteSize(bytes as usize))
     }
 }
 

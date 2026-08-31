@@ -14,7 +14,9 @@ pub mod flac_tags;
 pub mod plan;
 pub mod plan_resolve;
 pub mod progress;
+pub mod volumes;
 
 pub use plan::{plan_from_tags, sanitize_stored_name};
 pub use plan_resolve::PlanOverrides;
 pub use progress::{NoopProgress, ProgressSink};
+pub use volumes::{demodulate_file, join_volume_set, prepare_samples, strip_volume_suffix, volume_path};

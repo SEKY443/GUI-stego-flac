@@ -2,13 +2,15 @@
 
 use std::fs;
 use std::io::Read;
+use std::path::PathBuf;
 
 use anyhow::bail;
 use anyhow::{Context, Result};
+use audio_modem_core::frame::volume;
 use audio_modem_core::modem::ofdm::COVER_TELEPHONE_HZ;
 use audio_modem_core::{encode_frame, format, to_i16, Carrier, EncodeParams, KdfParams, Plan};
-use audio_modem_io::flac_tags::{PLAN_TAG, PROFILE_TAG};
-use audio_modem_io::{cover, flac_io};
+use audio_modem_io::flac_tags::{PLAN_TAG, PROFILE_TAG, VOLUME_TAG};
+use audio_modem_io::{cover, flac_io, volume_path};
 use serde_json::json;
 
 use crate::cli::{ChannelChoice, CoverMode, EncodeArgs};
@@ -131,16 +133,39 @@ pub fn run(args: &EncodeArgs) -> Result<()> {
     let plan = plan;
     let modem = Carrier::new(plan).context("building the modem")?;
 
+    // Splitting only ever applies to the plain, uncovered path: --split-size
+    // and --cover are mutually exclusive (see `EncodeArgs::split_size`), so
+    // `cover_audio` is always `None` whenever more than one part is written.
+    // A requested size at or above the finished frame collapses to a single
+    // part, written under the ordinary `output` path with no `.partI-of-N`
+    // suffix -- indistinguishable from never having passed --split-size.
+    let volume_size = args.split_size.filter(|size| size.0 < frame.len());
+    let parts: Vec<(PathBuf, Vec<u8>)> = match volume_size {
+        None => vec![(output.clone(), frame.clone())],
+        Some(size) => {
+            let slices = volume::split(&frame, size.0)?;
+            let count = slices.len() as u32;
+            slices
+                .into_iter()
+                .enumerate()
+                .map(|(i, bytes)| (volume_path(&output, i as u32 + 1, count), bytes))
+                .collect()
+        }
+    };
+    let volume_count = parts.len() as u32;
+
+    // Guard every part's path before writing any of them, so a name
+    // collision discovered on a later part doesn't leave earlier ones
+    // already on disk.
+    for (path, _) in &parts {
+        guard_output(path, args.force)?;
+    }
+
     stage.begin("modulating");
     // Cover mode is single-channel. The cover is meant to be heard as an
     // ordinary recording, and the lane splitting used for extra channels
     // produces one independent carrier per channel -- there is no sensible
     // single audible signal to spread across them.
-    let channels = match (args.channels, cover_audio.is_some()) {
-        (_, true) => 1,
-        (ChannelChoice::Fixed(n), false) => n,
-        (ChannelChoice::Auto, false) => plan.auto_channels(frame.len()),
-    };
     if cover_audio.is_some() {
         if let ChannelChoice::Fixed(requested) = args.channels {
             if requested > 1 {
@@ -152,31 +177,49 @@ pub fn run(args: &EncodeArgs) -> Result<()> {
             }
         }
     }
-    let samples = match &cover_audio {
-        Some(audio) => modem
-            .modulate_with_cover(&frame, audio, args.cover_mode == CoverMode::Spread)
-            .expect("cover support was checked when the plan was resolved"),
-        None => modem.modulate_interleaved(&frame, channels),
-    };
-    let pcm = to_i16(&samples);
 
-    stage.begin("encoding FLAC");
-    flac_io::write_flac(
-        &output,
-        &pcm,
-        plan.sample_rate(),
-        channels,
-        &tags(plan, &report_title(&report), &cover_tags),
-    )?;
+    let mut written = Vec::with_capacity(parts.len());
+    for (index, (path, part_frame)) in parts.iter().enumerate() {
+        let channels = match (args.channels, cover_audio.is_some()) {
+            (_, true) => 1,
+            (ChannelChoice::Fixed(n), false) => n,
+            (ChannelChoice::Auto, false) => plan.auto_channels(part_frame.len()),
+        };
+        let samples = match &cover_audio {
+            Some(audio) => modem
+                .modulate_with_cover(part_frame, audio, args.cover_mode == CoverMode::Spread)
+                .expect("cover support was checked when the plan was resolved"),
+            None => modem.modulate_interleaved(part_frame, channels),
+        };
+        let pcm = to_i16(&samples);
+
+        let volume_label = (volume_count > 1).then_some((index as u32 + 1, volume_count));
+        flac_io::write_flac(
+            path,
+            &pcm,
+            plan.sample_rate(),
+            channels,
+            &tags(plan, &report_title(&report, volume_label), &cover_tags, volume_label),
+        )?;
+
+        written.push(WrittenVolume {
+            path: path.clone(),
+            channels,
+            duration_secs: (samples.len() / channels) as f64 / f64::from(plan.sample_rate()),
+            carrier_bytes: 0,
+        });
+    }
     stage.done();
 
-    let carrier_bytes = fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
-    let duration = (samples.len() / channels) as f64 / f64::from(plan.sample_rate());
+    for volume in &mut written {
+        volume.carrier_bytes = fs::metadata(&volume.path).map(|m| m.len()).unwrap_or(0);
+    }
+    let total_carrier_bytes: u64 = written.iter().map(|v| v.carrier_bytes).sum();
 
     if args.output_args.json {
         let (low_hz, high_hz) = plan.band_hz();
         let out = json!({
-            "output_path": output.display().to_string(),
+            "output_path": (volume_count == 1).then(|| written[0].path.display().to_string()),
             "plaintext_bytes": report.plaintext_len,
             "compressed": report.compressed.then(|| json!({
                 "bytes": report.compressed_len,
@@ -201,11 +244,29 @@ pub fn run(args: &EncodeArgs) -> Result<()> {
                 "attenuation_db": args.cover_attenuation,
                 "metadata_kept": args.keep_cover_metadata,
             })),
-            "channels": channels,
-            "channels_auto": args.channels == ChannelChoice::Auto && cover_audio.is_none(),
-            "duration_secs": duration,
-            "carrier_bytes": carrier_bytes,
-            "carrier_ratio": carrier_bytes as f64 / report.plaintext_len.max(1) as f64,
+            "channels": (volume_count == 1).then_some(written[0].channels),
+            "channels_auto": volume_count == 1
+                && args.channels == ChannelChoice::Auto
+                && cover_audio.is_none(),
+            "duration_secs": (volume_count == 1).then_some(written[0].duration_secs),
+            "carrier_bytes": (volume_count == 1).then_some(written[0].carrier_bytes),
+            "carrier_ratio": (volume_count == 1)
+                .then(|| written[0].carrier_bytes as f64 / report.plaintext_len.max(1) as f64),
+            "split": (volume_count > 1).then(|| json!({
+                "volume_count": volume_count,
+                "requested_volume_size_bytes": volume_size.map(|s| s.0),
+                "total_carrier_bytes": total_carrier_bytes,
+                "total_carrier_ratio":
+                    total_carrier_bytes as f64 / report.plaintext_len.max(1) as f64,
+                "volumes": written.iter().enumerate().map(|(i, v)| json!({
+                    "part": i as u32 + 1,
+                    "of": volume_count,
+                    "path": v.path.display().to_string(),
+                    "channels": v.channels,
+                    "duration_secs": v.duration_secs,
+                    "carrier_bytes": v.carrier_bytes,
+                })).collect::<Vec<_>>(),
+            })),
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
         if !report.encrypted {
@@ -221,7 +282,21 @@ pub fn run(args: &EncodeArgs) -> Result<()> {
         return Ok(());
     }
 
-    println!("wrote {}", output.display());
+    if volume_count == 1 {
+        println!("wrote {}", written[0].path.display());
+    } else {
+        println!("wrote {volume_count} volumes:");
+        for (i, volume) in written.iter().enumerate() {
+            println!(
+                "  {}/{volume_count}  {}  ({}, {}, {} ch)",
+                i + 1,
+                volume.path.display(),
+                human_bytes(volume.carrier_bytes),
+                human_duration(volume.duration_secs),
+                volume.channels
+            );
+        }
+    }
     println!();
     println!(
         "  input              {}",
@@ -289,12 +364,20 @@ pub fn run(args: &EncodeArgs) -> Result<()> {
             }
         );
     }
+    if volume_count > 1 {
+        println!(
+            "  split              {volume_count} volumes, {} requested per part",
+            human_bytes(volume_size.map(|s| s.0 as u64).unwrap_or(0))
+        );
+    }
+    let total_duration: f64 = written.iter().map(|v| v.duration_secs).sum();
     println!(
         "  carrier            {}{}",
-        human_duration(duration),
-        if channels > 1 {
+        human_duration(total_duration),
+        if volume_count == 1 && written[0].channels > 1 {
             format!(
-                " across {channels} channels{}",
+                " across {} channels{}",
+                written[0].channels,
                 if args.channels == ChannelChoice::Auto {
                     " (auto)"
                 } else {
@@ -305,11 +388,19 @@ pub fn run(args: &EncodeArgs) -> Result<()> {
             String::new()
         }
     );
-    println!(
-        "  flac file          {} ({:.2}x plaintext)",
-        human_bytes(carrier_bytes),
-        carrier_bytes as f64 / report.plaintext_len.max(1) as f64
-    );
+    if volume_count > 1 {
+        println!(
+            "  flac files (total) {} ({:.2}x plaintext)",
+            human_bytes(total_carrier_bytes),
+            total_carrier_bytes as f64 / report.plaintext_len.max(1) as f64
+        );
+    } else {
+        println!(
+            "  flac file          {} ({:.2}x plaintext)",
+            human_bytes(total_carrier_bytes),
+            total_carrier_bytes as f64 / report.plaintext_len.max(1) as f64
+        );
+    }
 
     if !report.encrypted {
         eprintln!();
@@ -319,9 +410,21 @@ pub fn run(args: &EncodeArgs) -> Result<()> {
     Ok(())
 }
 
+/// One file this run produced, and what it cost to write.
+struct WrittenVolume {
+    path: PathBuf,
+    channels: usize,
+    duration_secs: f64,
+    carrier_bytes: u64,
+}
+
 /// Human-readable one-liner for the DESCRIPTION tag.
-fn report_title(report: &audio_modem_core::EncodeReport) -> String {
-    format!(
+///
+/// `volume_label`, when this file is one part of a split archive, appends its
+/// position so the tag alone identifies the part even if the filename is
+/// later changed.
+fn report_title(report: &audio_modem_core::EncodeReport, volume_label: Option<(u32, u32)>) -> String {
+    let base = format!(
         "stego-flac carrier, {} payload, {}",
         human_bytes(report.plaintext_len as u64),
         if report.encrypted {
@@ -329,7 +432,11 @@ fn report_title(report: &audio_modem_core::EncodeReport) -> String {
         } else {
             "not encrypted"
         }
-    )
+    );
+    match volume_label {
+        Some((index, count)) => format!("{base}, part {index}/{count}"),
+        None => base,
+    }
 }
 
 /// Metadata written into the carrier.
@@ -344,7 +451,12 @@ fn report_title(report: &audio_modem_core::EncodeReport) -> String {
 /// `AUDIOMODEM_PLAN`/`AUDIOMODEM_PROFILE` are excluded from that override:
 /// they are load-bearing, and a cover file has no business setting them,
 /// whatever it happens to be tagged with.
-fn tags(plan: Plan, description: &str, cover_tags: &[(String, String)]) -> Vec<(String, String)> {
+fn tags(
+    plan: Plan,
+    description: &str,
+    cover_tags: &[(String, String)],
+    volume_label: Option<(u32, u32)>,
+) -> Vec<(String, String)> {
     let mut tags = vec![
         ("TITLE".to_string(), "stego-flac carrier".to_string()),
         ("DESCRIPTION".to_string(), description.to_string()),
@@ -373,6 +485,10 @@ fn tags(plan: Plan, description: &str, cover_tags: &[(String, String)]) -> Vec<(
             tags.push((PROFILE_TAG.to_string(), profile.name().to_string()));
             break;
         }
+    }
+
+    if let Some((index, count)) = volume_label {
+        tags.push((VOLUME_TAG.to_string(), format!("{index}/{count}")));
     }
 
     tags

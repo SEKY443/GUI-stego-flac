@@ -51,6 +51,14 @@ export interface Argon2Dto {
   pCost: number;
 }
 
+export interface VolumeInfoDto {
+  archiveId: string;
+  part: number;
+  of: number;
+  volumeBytes: number;
+  totalFrameBytes: number;
+}
+
 export interface InfoDto {
   path: string;
   sampleRateHz: number;
@@ -62,18 +70,20 @@ export interface InfoDto {
   waveformDescription: string;
   bitRate: number;
   bandHz: [number, number];
-  formatVersion: number;
-  payloadBytes: number;
-  compressed: boolean;
-  encrypted: boolean;
+  // `null` for one part of a split archive — see `volume` instead.
+  formatVersion: number | null;
+  payloadBytes: number | null;
+  compressed: boolean | null;
+  encrypted: boolean | null;
   argon2id: Argon2Dto | null;
-  nameStored: boolean;
-  formatStored: boolean;
-  fec: boolean;
-  fecSymbolSizeBytes: number;
-  frameBytes: number;
-  carriedBytes: number;
+  nameStored: boolean | null;
+  formatStored: boolean | null;
+  fec: boolean | null;
+  fecSymbolSizeBytes: number | null;
+  frameBytes: number | null;
+  carriedBytes: number | null;
   shortByBytes: number | null;
+  volume: VolumeInfoDto | null;
   warnings: string[];
 }
 
@@ -98,6 +108,9 @@ export interface DecodeReportDto {
   format: FormatDto | null;
   encodedAtUnix: number | null;
   warnings: string[];
+  // The part count when the input was one part of a split archive that
+  // decode located and reassembled on its own; `null` otherwise.
+  volumesJoined: number | null;
 }
 
 export interface CoverOptions {
@@ -119,6 +132,10 @@ export interface EncodeRequest {
   fecSymbolSize: number;
   channels: ChannelsChoice;
   cover?: CoverOptions;
+  // Split the carrier across several smaller FLAC files instead of one.
+  // `undefined`, or a size at or above the finished frame, writes a single
+  // file. Mutually exclusive with `cover`.
+  splitSizeBytes?: number;
   plan: PlanArgsDto;
   force: boolean;
 }
@@ -128,7 +145,18 @@ export interface CompressedDto {
   ratio: number;
 }
 
+export interface EncodedVolumeDto {
+  part: number;
+  of: number;
+  path: string;
+  channels: number;
+  durationSecs: number;
+  carrierBytes: number;
+}
+
 export interface EncodeReportDto {
+  // The single carrier's path, or the first volume's path when split into
+  // several — see `volumes` for the rest.
   outputPath: string;
   plaintextBytes: number;
   compressed: CompressedDto | null;
@@ -148,6 +176,9 @@ export interface EncodeReportDto {
   durationSecs: number;
   carrierBytes: number;
   carrierRatio: number;
+  // One entry per part when `splitSizeBytes` produced more than one volume;
+  // empty for an ordinary single-file carrier.
+  volumes: EncodedVolumeDto[];
 }
 
 export interface CommandError {

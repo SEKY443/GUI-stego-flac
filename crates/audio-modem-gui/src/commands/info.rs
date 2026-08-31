@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use audio_modem_core::frame::volume::{self, VolumeHeader};
 use audio_modem_core::{from_i16, Carrier, Header, HEADER_LEN};
 use audio_modem_io::flac_io;
 use audio_modem_io::flac_tags::{self, PLAN_TAG, PROFILE_TAG};
@@ -20,6 +21,16 @@ pub struct Argon2Dto {
     pub p_cost: u32,
 }
 
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeInfoDto {
+    pub archive_id: String,
+    pub part: u32,
+    pub of: u32,
+    pub volume_bytes: u64,
+    pub total_frame_bytes: u64,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InfoDto {
@@ -33,18 +44,23 @@ pub struct InfoDto {
     pub waveform_description: String,
     pub bit_rate: f64,
     pub band_hz: (f64, f64),
-    pub format_version: u8,
-    pub payload_bytes: u64,
-    pub compressed: bool,
-    pub encrypted: bool,
+    /// `None` for one part of a split archive — see `volume` instead, since a
+    /// lone volume's own header does not describe the frame it carries a
+    /// slice of.
+    pub format_version: Option<u8>,
+    pub payload_bytes: Option<u64>,
+    pub compressed: Option<bool>,
+    pub encrypted: Option<bool>,
     pub argon2id: Option<Argon2Dto>,
-    pub name_stored: bool,
-    pub format_stored: bool,
-    pub fec: bool,
-    pub fec_symbol_size_bytes: u16,
-    pub frame_bytes: u64,
-    pub carried_bytes: u64,
+    pub name_stored: Option<bool>,
+    pub format_stored: Option<bool>,
+    pub fec: Option<bool>,
+    pub fec_symbol_size_bytes: Option<u16>,
+    pub frame_bytes: Option<u64>,
+    pub carried_bytes: Option<u64>,
     pub short_by_bytes: Option<u64>,
+    /// Present when this file is one part of a `--split-size` archive.
+    pub volume: Option<VolumeInfoDto>,
     pub warnings: Vec<String>,
 }
 
@@ -101,6 +117,49 @@ pub fn inspect(path: String, plan: PlanArgsDto) -> CmdResult<InfoDto> {
     let header_bytes = modem
         .demodulate_interleaved(&header_samples, audio.channels)
         .map_err(|error| CommandError::from(error.to_string()))?;
+
+    // A split archive's parts start "AMVL", not the plain frame's "AMDM":
+    // report what this part is, rather than failing with "bad magic" on
+    // something that is a perfectly good stego-flac file, just not this one.
+    // `header_bytes` already holds enough for the volume header regardless,
+    // since `VOLUME_HEADER_LEN` (48) is smaller than `HEADER_LEN` (92).
+    if header_bytes.len() >= 4 && header_bytes[0..4] == volume::VOLUME_MAGIC {
+        let volume_header = VolumeHeader::parse(&header_bytes)
+            .map_err(|error| CommandError::from(error.to_string()))?;
+        return Ok(InfoDto {
+            path: path.display().to_string(),
+            sample_rate_hz: audio.sample_rate,
+            channels: audio.channels,
+            samples: audio.samples.len(),
+            duration_secs: duration,
+            profile_label,
+            plan_in_metadata,
+            waveform_description: resolved.describe(),
+            bit_rate: resolved.bit_rate(),
+            band_hz: (low_hz, high_hz),
+            format_version: None,
+            payload_bytes: None,
+            compressed: None,
+            encrypted: None,
+            argon2id: None,
+            name_stored: None,
+            format_stored: None,
+            fec: None,
+            fec_symbol_size_bytes: None,
+            frame_bytes: None,
+            carried_bytes: None,
+            short_by_bytes: None,
+            volume: Some(VolumeInfoDto {
+                archive_id: format!("{:016x}", volume_header.archive_id),
+                part: volume_header.volume_index + 1,
+                of: volume_header.volume_count,
+                volume_bytes: volume_header.volume_len,
+                total_frame_bytes: volume_header.total_len,
+            }),
+            warnings,
+        });
+    }
+
     let header = Header::parse(&header_bytes).map_err(|error| CommandError::from(error.to_string()))?;
 
     let declared = header.frame_len();
@@ -120,22 +179,23 @@ pub fn inspect(path: String, plan: PlanArgsDto) -> CmdResult<InfoDto> {
         waveform_description: resolved.describe(),
         bit_rate: resolved.bit_rate(),
         band_hz: (low_hz, high_hz),
-        format_version: header.version,
-        payload_bytes: header.original_len,
-        compressed: header.is_compressed(),
-        encrypted: header.is_encrypted(),
+        format_version: Some(header.version),
+        payload_bytes: Some(header.original_len),
+        compressed: Some(header.is_compressed()),
+        encrypted: Some(header.is_encrypted()),
         argon2id: header.is_encrypted().then_some(Argon2Dto {
             m_cost_kib: header.kdf.m_cost,
             t_cost: header.kdf.t_cost,
             p_cost: header.kdf.p_cost,
         }),
-        name_stored: header.is_named(),
-        format_stored: header.has_format(),
-        fec: header.is_fec(),
-        fec_symbol_size_bytes: header.fec_symbol_size,
-        frame_bytes: declared,
-        carried_bytes: carried,
+        name_stored: Some(header.is_named()),
+        format_stored: Some(header.has_format()),
+        fec: Some(header.is_fec()),
+        fec_symbol_size_bytes: Some(header.fec_symbol_size),
+        frame_bytes: Some(declared),
+        carried_bytes: Some(carried),
         short_by_bytes: (carried < declared).then(|| declared - carried),
+        volume: None,
         warnings,
     })
 }

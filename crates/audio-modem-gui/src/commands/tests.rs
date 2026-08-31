@@ -15,7 +15,7 @@ use super::decode::{decode_blocking, DecodeRequest};
 use super::encode::{encode_blocking, CoverOptions, EncodeRequest};
 use super::info::inspect;
 use super::plan::PlanArgsDto;
-use super::test_support::{tone_wav, TempDir};
+use super::test_support::{incompressible, tone_wav, TempDir};
 
 fn base_encode_request(input: PathBuf, output: PathBuf) -> EncodeRequest {
     EncodeRequest {
@@ -29,6 +29,7 @@ fn base_encode_request(input: PathBuf, output: PathBuf) -> EncodeRequest {
         fec_symbol_size: DEFAULT_SYMBOL_SIZE,
         channels: "auto".to_string(),
         cover: None,
+        split_size_bytes: None,
         plan: PlanArgsDto::default(),
         force: false,
     }
@@ -282,11 +283,12 @@ fn inspect_reports_the_headers_of_a_real_carrier() {
     encode_blocking(&NoopProgress, request).expect("encode");
 
     let info = inspect(carrier.display().to_string(), PlanArgsDto::default()).expect("inspect");
-    assert!(info.encrypted);
-    assert!(info.fec);
-    assert!(info.name_stored);
+    assert_eq!(info.encrypted, Some(true));
+    assert_eq!(info.fec, Some(true));
+    assert_eq!(info.name_stored, Some(true));
     assert!(info.argon2id.is_some());
     assert_eq!(info.short_by_bytes, None, "a freshly written carrier is never short");
+    assert_eq!(info.volume, None, "a plain carrier is not a split volume");
 }
 
 #[test]
@@ -302,6 +304,94 @@ fn no_store_name_leaves_the_carrier_anonymous() {
     assert_eq!(report.stored_name, None);
 
     let info = inspect(carrier.display().to_string(), PlanArgsDto::default()).expect("inspect");
-    assert!(!info.name_stored);
-    assert!(!info.format_stored);
+    assert_eq!(info.name_stored, Some(false));
+    assert_eq!(info.format_stored, Some(false));
+}
+
+#[test]
+fn split_size_produces_volumes_that_decode_finds_and_joins_from_any_part() {
+    let dir = TempDir::new("split-roundtrip");
+    let input = dir.join("secret.bin");
+    let carrier = dir.join("carrier.flac");
+    let data = incompressible(150_000, 11);
+    std::fs::write(&input, &data).unwrap();
+
+    let mut request = base_encode_request(input, carrier.clone());
+    request.split_size_bytes = Some(40_000);
+    let report = encode_blocking(&NoopProgress, request).expect("encode");
+    assert!(
+        report.volumes.len() >= 2,
+        "expected split_size_bytes to produce multiple volumes, got {}",
+        report.volumes.len()
+    );
+    assert!(!carrier.exists(), "the unsplit carrier.flac name should not exist once split");
+
+    // Pointed at the *last* volume, not the first -- proving discovery walks
+    // outward from whichever file it was given, not just forward from part 1.
+    let last = report.volumes.last().unwrap();
+    let landing = dir.join("recovered.bin");
+    let decoded = decode_blocking(
+        &NoopProgress,
+        base_decode_request(PathBuf::from(&last.path), Some(landing.clone())),
+    )
+    .expect("decode from the last volume");
+    assert_eq!(decoded.volumes_joined, Some(report.volumes.len() as u32));
+    assert_eq!(std::fs::read(&landing).unwrap(), data);
+}
+
+#[test]
+fn a_split_size_above_the_frame_produces_a_single_plain_file() {
+    let dir = TempDir::new("split-fallback");
+    let input = dir.join("small.bin");
+    let carrier = dir.join("carrier.flac");
+    std::fs::write(&input, incompressible(2_000, 3)).unwrap();
+
+    let mut request = base_encode_request(input, carrier.clone());
+    request.split_size_bytes = Some(10 * 1024 * 1024);
+    let report = encode_blocking(&NoopProgress, request).expect("encode");
+    assert!(report.volumes.is_empty(), "everything fit in one volume");
+    assert_eq!(report.output_path, carrier.display().to_string());
+    assert!(carrier.exists());
+}
+
+#[test]
+fn split_size_and_cover_audio_are_mutually_exclusive() {
+    let dir = TempDir::new("split-cover-conflict");
+    let input = dir.join("secret.bin");
+    let cover_path = dir.join("cover.wav");
+    let carrier = dir.join("carrier.flac");
+    std::fs::write(&input, incompressible(2_000, 5)).unwrap();
+    std::fs::write(&cover_path, tone_wav(1)).unwrap();
+
+    let mut request = base_encode_request(input, carrier);
+    request.split_size_bytes = Some(1_000);
+    request.cover = Some(CoverOptions {
+        path: cover_path.display().to_string(),
+        quality: "auto".to_string(),
+        mode: "cut".to_string(),
+        attenuation_db: 25.0,
+        keep_metadata: false,
+    });
+    let error = encode_blocking(&NoopProgress, request).unwrap_err();
+    assert!(error.message.contains("split"), "got: {}", error.message);
+}
+
+#[test]
+fn inspect_reports_a_lone_volume_summary() {
+    let dir = TempDir::new("inspect-volume");
+    let input = dir.join("secret.bin");
+    let carrier = dir.join("carrier.flac");
+    std::fs::write(&input, incompressible(150_000, 7)).unwrap();
+
+    let mut request = base_encode_request(input, carrier);
+    request.split_size_bytes = Some(40_000);
+    let report = encode_blocking(&NoopProgress, request).expect("encode");
+    assert!(report.volumes.len() >= 2);
+
+    let info = inspect(report.volumes[0].path.clone(), PlanArgsDto::default()).expect("inspect");
+    let volume = info.volume.expect("a split part should report volume info");
+    assert_eq!(volume.part, 1);
+    assert_eq!(volume.of, report.volumes.len() as u32);
+    assert_eq!(info.encrypted, None, "a volume header does not describe the frame header");
+    assert_eq!(info.frame_bytes, None);
 }

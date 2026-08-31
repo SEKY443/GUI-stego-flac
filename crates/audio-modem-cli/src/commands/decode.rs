@@ -5,8 +5,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use audio_modem_core::{decode_frame, from_i16, Carrier, Header};
-use audio_modem_io::flac_io;
+use audio_modem_core::frame::volume::{self, VolumeHeader};
+use audio_modem_core::{decode_frame, Carrier, Header};
+use audio_modem_io::{flac_io, join_volume_set, prepare_samples};
 use serde_json::json;
 
 use crate::cli::{is_stream, DecodeArgs};
@@ -32,7 +33,20 @@ pub fn run(args: &DecodeArgs) -> Result<()> {
     stage.begin("demodulating");
     // The channel count comes from the container's own header, so nothing has
     // to be recorded in the metadata or remembered by the reader.
-    let frame = modem.demodulate_interleaved(&samples, audio.channels)?;
+    let piece = modem.demodulate_interleaved(&samples, audio.channels)?;
+
+    // A plain frame starts "AMDM" and is decoded as-is; a volume starts
+    // "AMVL" and means `args.input` is only one part of a split archive. The
+    // rest are found by filename, demodulated the same way, and joined back
+    // into the single frame `decode_frame` expects -- from here on nothing
+    // below has to know splitting happened.
+    let (frame, volumes_joined) = if piece.len() >= 4 && piece[0..4] == volume::VOLUME_MAGIC {
+        stage.begin("locating and joining volumes");
+        let count = VolumeHeader::parse(&piece).map(|h| h.volume_count).ok();
+        (join_volume_set(&args.input, piece, &modem)?, count)
+    } else {
+        (piece, None)
+    };
     stage.done();
 
     // Read the header before asking for a passphrase, so a tone-plan mismatch
@@ -69,9 +83,16 @@ pub fn run(args: &DecodeArgs) -> Result<()> {
             .write_all(&payload.data)
             .context("writing standard output")?;
         if args.output_args.json {
-            eprintln!("{}", serde_json::to_string_pretty(&summary(&payload, None))?);
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(&summary(&payload, None, volumes_joined))?
+            );
         } else if !args.quiet {
-            eprintln!("recovered {}", human_bytes(payload.data.len() as u64));
+            eprintln!(
+                "recovered {}{}",
+                human_bytes(payload.data.len() as u64),
+                volume_note(volumes_joined)
+            );
         }
         return Ok(());
     }
@@ -84,34 +105,50 @@ pub fn run(args: &DecodeArgs) -> Result<()> {
     if args.output_args.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&summary(&payload, Some(&output)))?
+            serde_json::to_string_pretty(&summary(&payload, Some(&output), volumes_joined))?
         );
     } else if !args.quiet {
         println!(
-            "recovered {} to {}{}",
+            "recovered {} to {}{}{}",
             human_bytes(payload.data.len() as u64),
             output.display(),
             match payload.format {
                 Some(format) => format!(" ({})", format.description),
                 None => String::new(),
-            }
+            },
+            volume_note(volumes_joined)
         );
     }
 
     Ok(())
 }
 
+/// Text-mode aside noting how many volumes were joined, or nothing at all
+/// for an ordinary single-file carrier.
+fn volume_note(volumes_joined: Option<u32>) -> String {
+    match volumes_joined {
+        Some(count) => format!(" (reassembled from {count} volumes)"),
+        None => String::new(),
+    }
+}
+
 /// Build the machine-readable decode summary.
 ///
 /// `output` is `None` when the payload went to standard output instead of a
-/// file.
-fn summary(payload: &audio_modem_core::DecodedPayload, output: Option<&Path>) -> serde_json::Value {
+/// file. `volumes_joined` is the part count when `input` was one part of a
+/// split archive that `decode` located and reassembled on its own.
+fn summary(
+    payload: &audio_modem_core::DecodedPayload,
+    output: Option<&Path>,
+    volumes_joined: Option<u32>,
+) -> serde_json::Value {
     json!({
         "output_path": output.map(|path| path.display().to_string()),
         "recovered_bytes": payload.data.len(),
         "name": payload.name,
         "format": payload.format.map(format_to_json),
         "encoded_at_unix": payload.encoded_at,
+        "volumes_joined": volumes_joined,
     })
 }
 
@@ -139,50 +176,4 @@ fn resolve_output(args: &DecodeArgs, stored: Option<&str>) -> Result<PathBuf> {
     }
 
     Ok(PathBuf::from(safe))
-}
-
-/// Validate the container against the tone plan and trim to a decodable length.
-fn prepare_samples(audio: &flac_io::FlacAudio, modem: &Carrier, path: &Path) -> Result<Vec<f32>> {
-    let plan = modem.plan();
-    if audio.channels == 0 || audio.channels > 8 {
-        bail!(
-            "{} declares {} channels; stego-flac carriers use 1 to 8",
-            path.display(),
-            audio.channels
-        );
-    }
-
-    if audio.sample_rate != plan.sample_rate() {
-        bail!(
-            "{} is {} Hz but the tone plan expects {} Hz; pass --sample-rate {} \
-             (every tone frequency is defined relative to the sample rate, so a \
-             mismatch shifts the whole plan)",
-            path.display(),
-            audio.sample_rate,
-            plan.sample_rate(),
-            audio.sample_rate
-        );
-    }
-
-    // Trim to a whole number of bytes' worth of symbols. A FLAC encoder is free
-    // to pad its final block, and a truncated carrier is exactly the case FEC
-    // exists to survive, so a ragged tail is discarded rather than rejected.
-    // Interleaved samples must divide evenly into whole frames *and* leave each
-    // lane a whole number of symbols.
-    let group = modem.alignment_samples() * audio.channels;
-    let usable = audio.samples.len() - audio.samples.len() % group;
-
-    if usable == 0 {
-        bail!(
-            "{} holds {} samples, fewer than one symbol group",
-            path.display(),
-            audio.samples.len()
-        );
-    }
-
-    // The remainder is discarded silently. It is always benign: the encoder
-    // pads the carrier to a whole number of FLAC blocks, and the frame header
-    // declares the payload length, so trailing samples are never part of the
-    // message. Warning about them would fire on almost every successful decode.
-    Ok(from_i16(&audio.samples[..usable]))
 }

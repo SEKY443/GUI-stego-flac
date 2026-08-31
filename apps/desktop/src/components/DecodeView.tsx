@@ -89,12 +89,27 @@ export function DecodeView() {
 
       {probeError && <Banner kind="error">{probeError}</Banner>}
 
-      {probe && (
+      {probe?.volume && (
+        <Section title="Split archive volume">
+          <Row label="Part" value={`${probe.volume.part} of ${probe.volume.of}`} />
+          <Row label="Archive ID" value={probe.volume.archiveId} />
+          <Row label="Waveform" value={probe.waveformDescription} />
+          <Row label="Duration" value={`${probe.durationSecs.toFixed(1)} s`} />
+          <Row label="Volume payload" value={humanBytes(probe.volume.volumeBytes)} />
+          <Row label="Full frame" value={humanBytes(probe.volume.totalFrameBytes)} />
+          <Banner kind="info">
+            Decoding this file locates the other {probe.volume.of - 1} part(s) next to it and
+            reassembles the frame automatically.
+          </Banner>
+        </Section>
+      )}
+
+      {probe && !probe.volume && (
         <Section title="Carrier header">
           <Row label="Waveform" value={probe.waveformDescription} />
           <Row label="Profile" value={probe.profileLabel} />
           <Row label="Duration" value={`${probe.durationSecs.toFixed(1)} s`} />
-          <Row label="Payload size" value={humanBytes(probe.payloadBytes)} />
+          <Row label="Payload size" value={humanBytes(probe.payloadBytes ?? 0)} />
           <Row label="Compressed" value={probe.compressed ? "yes" : "no"} />
           <Row label="Encrypted" value={probe.encrypted ? "yes" : "no"} />
           <Row label="Filename stored" value={probe.nameStored ? "yes (visible after decode)" : "no"} />
@@ -162,6 +177,9 @@ export function DecodeView() {
             label="Encoded at"
             value={report.encodedAtUnix ? new Date(report.encodedAtUnix * 1000).toLocaleString() : "(not stored)"}
           />
+          {report.volumesJoined != null && (
+            <Row label="Split archive" value={`reassembled from ${report.volumesJoined} volumes`} />
+          )}
           {report.warnings.map((warning, i) => (
             <Banner key={i} kind="warning">
               {warning}

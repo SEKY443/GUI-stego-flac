@@ -72,7 +72,7 @@ pub use error::{
     CompressError, ConfigError, CoreError, CryptoError, DemodError, FecError, FrameError,
 };
 pub use format::FileFormat;
-pub use frame::{Header, HEADER_LEN};
+pub use frame::{Header, VolumeHeader, HEADER_LEN, VOLUME_HEADER_LEN};
 pub use modem::{from_i16, to_i16, FskModem, ModemConfig, SymbolDetector};
 pub use modem::{Carrier, OfdmConfig, OfdmModem, Plan, PlanParseError, Profile};
 pub use pipeline::{

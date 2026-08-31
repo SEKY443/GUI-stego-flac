@@ -34,6 +34,14 @@ pub const VORBIS_COMMENT_BLOCK: u8 = 4;
 pub const PLAN_TAG: &str = "AUDIOMODEM_PLAN";
 /// Tag holding the profile name, when a preset was used.
 pub const PROFILE_TAG: &str = "AUDIOMODEM_PROFILE";
+/// Tag holding this file's position in a split archive, as `"I/N"`.
+///
+/// Purely a convenience, readable without demodulating anything — like
+/// [`PLAN_TAG`], it is not load-bearing. `decode` locates and orders volumes
+/// from the authenticated header each one carries in its modulated payload,
+/// not from this tag, so a carrier with this tag stripped is still exactly as
+/// recoverable as one that never had it.
+pub const VOLUME_TAG: &str = "AUDIOMODEM_VOLUME";
 
 const VENDOR: &str = concat!("stego-flac ", env!("CARGO_PKG_VERSION"));
 

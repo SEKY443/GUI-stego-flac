@@ -2,10 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
+use audio_modem_core::frame::volume;
 use audio_modem_core::modem::ofdm::{COVER_FULL_HZ, COVER_TELEPHONE_HZ, COVER_WIDE_HZ};
 use audio_modem_core::{encode_frame, format, to_i16, Carrier, EncodeParams, FecParams, KdfParams, Plan};
-use audio_modem_io::flac_tags::{PLAN_TAG, PROFILE_TAG};
-use audio_modem_io::{cover, flac_io, ProgressSink};
+use audio_modem_io::flac_tags::{PLAN_TAG, PROFILE_TAG, VOLUME_TAG};
+use audio_modem_io::{cover, flac_io, volume_path, ProgressSink};
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use zeroize::Zeroizing;
@@ -42,6 +43,10 @@ pub struct EncodeRequest {
     /// `"auto"` or `"1"`..`"8"`.
     pub channels: String,
     pub cover: Option<CoverOptions>,
+    /// Split the carrier across several smaller FLAC files instead of one.
+    /// `None` or a size at or above the finished frame writes a single file.
+    /// Mutually exclusive with `cover`, mirroring the CLI's `--split-size`.
+    pub split_size_bytes: Option<u64>,
     #[serde(default)]
     pub plan: PlanArgsDto,
     pub force: bool,
@@ -57,6 +62,8 @@ pub struct CompressedDto {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncodeReportDto {
+    /// The single carrier's path, or the first volume's path when split into
+    /// several — see `volumes` for the rest.
     pub output_path: String,
     pub plaintext_bytes: usize,
     pub compressed: Option<CompressedDto>,
@@ -76,6 +83,21 @@ pub struct EncodeReportDto {
     pub duration_secs: f64,
     pub carrier_bytes: u64,
     pub carrier_ratio: f64,
+    /// One entry per part when `split_size_bytes` produced more than one
+    /// volume; empty for an ordinary single-file carrier, in which case the
+    /// top-level fields above already describe the whole result.
+    pub volumes: Vec<EncodedVolumeDto>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncodedVolumeDto {
+    pub part: u32,
+    pub of: u32,
+    pub path: String,
+    pub channels: usize,
+    pub duration_secs: f64,
+    pub carrier_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +139,14 @@ pub(crate) fn encode_blocking(
             "{} already exists",
             output.display()
         )));
+    }
+
+    if request.cover.is_some() && request.split_size_bytes.is_some() {
+        return Err(CommandError::from(
+            "splitting into volumes cannot be combined with cover audio: a split's parts \
+             would each need their own disguise. Drop one or the other."
+                .to_string(),
+        ));
     }
 
     let mut plan = request.plan.resolve(None)?;
@@ -222,6 +252,36 @@ pub(crate) fn encode_blocking(
     let plan = plan;
     let modem = Carrier::new(plan).map_err(|error| CommandError::from(error.to_string()))?;
 
+    // Splitting only ever applies to the plain, uncovered path: `cover` and
+    // `split_size_bytes` are mutually exclusive (checked above), so
+    // `cover_audio` is always `None` whenever more than one part is written.
+    // A requested size at or above the finished frame collapses to a single
+    // part, written under the ordinary `output` path with no `.partI-of-N`
+    // suffix.
+    let volume_size = request.split_size_bytes.map(|n| n as usize).filter(|&n| n < frame.len());
+    let parts: Vec<(PathBuf, Vec<u8>)> = match volume_size {
+        None => vec![(output.clone(), frame.clone())],
+        Some(size) => {
+            let slices = volume::split(&frame, size).map_err(|error| CommandError::from(error.to_string()))?;
+            let count = slices.len() as u32;
+            slices
+                .into_iter()
+                .enumerate()
+                .map(|(i, bytes)| (volume_path(&output, i as u32 + 1, count), bytes))
+                .collect()
+        }
+    };
+    let volume_count = parts.len() as u32;
+
+    // Guard every part's path before writing any of them, so a name
+    // collision discovered on a later part doesn't leave earlier ones
+    // already on disk.
+    for (path, _) in &parts {
+        if path.exists() && !request.force {
+            return Err(CommandError::from(format!("{} already exists", path.display())));
+        }
+    }
+
     progress.stage("modulating");
 
     // Cover mode is single-channel: the cover is meant to be heard as one
@@ -239,42 +299,59 @@ pub(crate) fn encode_blocking(
             }
         }
     }
-    let channels = match (channels_choice, cover_audio.is_some()) {
-        (_, true) => 1,
-        (ChannelChoice::Fixed(n), false) => n,
-        (ChannelChoice::Auto, false) => plan.auto_channels(frame.len()),
-    };
 
-    let samples = match &cover_audio {
-        Some(audio) => {
-            let spread = request
-                .cover
-                .as_ref()
-                .is_some_and(|opts| opts.mode == "spread");
-            modem
-                .modulate_with_cover(&frame, audio, spread)
-                .ok_or_else(|| CommandError::from("cover support was already checked".to_string()))?
-        }
-        None => modem.modulate_interleaved(&frame, channels),
-    };
-    let pcm = to_i16(&samples);
+    let mut written = Vec::with_capacity(parts.len());
+    for (index, (path, part_frame)) in parts.iter().enumerate() {
+        let channels = match (channels_choice, cover_audio.is_some()) {
+            (_, true) => 1,
+            (ChannelChoice::Fixed(n), false) => n,
+            (ChannelChoice::Auto, false) => plan.auto_channels(part_frame.len()),
+        };
 
-    progress.stage("encoding FLAC");
-    flac_io::write_flac(
-        &output,
-        &pcm,
-        plan.sample_rate(),
-        channels,
-        &tags(plan, &report, &cover_tags),
-    )
-    .map_err(CommandError::from)?;
+        let samples = match &cover_audio {
+            Some(audio) => {
+                let spread = request
+                    .cover
+                    .as_ref()
+                    .is_some_and(|opts| opts.mode == "spread");
+                modem
+                    .modulate_with_cover(part_frame, audio, spread)
+                    .ok_or_else(|| CommandError::from("cover support was already checked".to_string()))?
+            }
+            None => modem.modulate_interleaved(part_frame, channels),
+        };
+        let pcm = to_i16(&samples);
 
-    let carrier_bytes = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
-    let duration = (samples.len() / channels) as f64 / f64::from(plan.sample_rate());
+        let volume_label = (volume_count > 1).then_some((index as u32 + 1, volume_count));
+        flac_io::write_flac(
+            path,
+            &pcm,
+            plan.sample_rate(),
+            channels,
+            &tags(plan, &report, &cover_tags, volume_label),
+        )
+        .map_err(CommandError::from)?;
+
+        written.push(EncodedVolume {
+            path: path.clone(),
+            channels,
+            duration_secs: (samples.len() / channels) as f64 / f64::from(plan.sample_rate()),
+            carrier_bytes: 0,
+        });
+    }
+
+    for volume in &mut written {
+        volume.carrier_bytes = std::fs::metadata(&volume.path).map(|m| m.len()).unwrap_or(0);
+    }
+
     let (low_hz, high_hz) = plan.band_hz();
+    let total_carrier_bytes: u64 = written.iter().map(|v| v.carrier_bytes).sum();
+    let total_duration: f64 = written.iter().map(|v| v.duration_secs).sum();
+    let carrier_bytes = if volume_count > 1 { total_carrier_bytes } else { written[0].carrier_bytes };
+    let duration = if volume_count > 1 { total_duration } else { written[0].duration_secs };
 
     Ok(EncodeReportDto {
-        output_path: output.display().to_string(),
+        output_path: written[0].path.display().to_string(),
         plaintext_bytes: report.plaintext_len,
         compressed: report.compressed.then(|| CompressedDto {
             bytes: report.compressed_len,
@@ -291,12 +368,36 @@ pub(crate) fn encode_blocking(
         bit_rate: plan.bit_rate(),
         band_hz: (low_hz, high_hz),
         cover_band_hz: plan.cover_band_hz(),
-        channels,
-        channels_auto: channels_choice == ChannelChoice::Auto && cover_audio.is_none(),
+        channels: written[0].channels,
+        channels_auto: volume_count == 1 && channels_choice == ChannelChoice::Auto && cover_audio.is_none(),
         duration_secs: duration,
         carrier_bytes,
         carrier_ratio: carrier_bytes as f64 / report.plaintext_len.max(1) as f64,
+        volumes: if volume_count > 1 {
+            written
+                .iter()
+                .enumerate()
+                .map(|(i, v)| EncodedVolumeDto {
+                    part: i as u32 + 1,
+                    of: volume_count,
+                    path: v.path.display().to_string(),
+                    channels: v.channels,
+                    duration_secs: v.duration_secs,
+                    carrier_bytes: v.carrier_bytes,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     })
+}
+
+/// One file this run produced, and what it cost to write.
+struct EncodedVolume {
+    path: PathBuf,
+    channels: usize,
+    duration_secs: f64,
+    carrier_bytes: u64,
 }
 
 /// Metadata written into the carrier — see `audio-modem-cli`'s `encode.rs` for
@@ -306,6 +407,7 @@ fn tags(
     plan: Plan,
     report: &audio_modem_core::EncodeReport,
     cover_tags: &[(String, String)],
+    volume_label: Option<(u32, u32)>,
 ) -> Vec<(String, String)> {
     let mut tags = vec![
         ("TITLE".to_string(), "stego-flac carrier".to_string()),
@@ -343,6 +445,10 @@ fn tags(
             tags.push((PROFILE_TAG.to_string(), profile.name().to_string()));
             break;
         }
+    }
+
+    if let Some((index, count)) = volume_label {
+        tags.push((VOLUME_TAG.to_string(), format!("{index}/{count}")));
     }
 
     tags
@@ -392,7 +498,7 @@ mod tests {
     #[test]
     fn tags_always_carries_the_load_bearing_plan_tag() {
         let plan = Profile::Dense.plan();
-        let tags = tags(plan, &dummy_report(true), &[]);
+        let tags = tags(plan, &dummy_report(true), &[], None);
         let plan_value = tags.iter().find(|(k, _)| k == PLAN_TAG).map(|(_, v)| v.clone());
         assert_eq!(plan_value.as_deref(), Some(plan.to_plan_string().as_str()));
     }
@@ -400,7 +506,7 @@ mod tests {
     #[test]
     fn a_recognised_profile_gets_a_profile_tag_too() {
         let plan = Profile::Fast.plan();
-        let tags = tags(plan, &dummy_report(true), &[]);
+        let tags = tags(plan, &dummy_report(true), &[], None);
         assert!(tags.iter().any(|(k, v)| k == PROFILE_TAG && v == "fast"));
     }
 
@@ -412,7 +518,7 @@ mod tests {
             (PROFILE_TAG.to_string(), "forged".to_string()),
             ("ARTIST".to_string(), "Someone".to_string()),
         ];
-        let tags = tags(plan, &dummy_report(true), &cover_tags);
+        let tags = tags(plan, &dummy_report(true), &cover_tags, None);
 
         let plan_value = tags.iter().find(|(k, _)| k == PLAN_TAG).unwrap().1.clone();
         assert_eq!(plan_value, plan.to_plan_string());
@@ -426,10 +532,17 @@ mod tests {
     fn cover_tags_override_the_default_title_and_description() {
         let plan = Profile::Dense.plan();
         let cover_tags = vec![("TITLE".to_string(), "My Recording".to_string())];
-        let tags = tags(plan, &dummy_report(false), &cover_tags);
+        let tags = tags(plan, &dummy_report(false), &cover_tags, None);
         let title = tags.iter().find(|(k, _)| k == "TITLE").unwrap().1.clone();
         assert_eq!(title, "My Recording");
         // Only one TITLE entry, not a duplicate.
         assert_eq!(tags.iter().filter(|(k, _)| k == "TITLE").count(), 1);
+    }
+
+    #[test]
+    fn a_volume_label_adds_the_volume_tag() {
+        let plan = Profile::Dense.plan();
+        let tags = tags(plan, &dummy_report(true), &[], Some((2, 5)));
+        assert!(tags.iter().any(|(k, v)| k == VOLUME_TAG && v == "2/5"));
     }
 }
